@@ -94,17 +94,17 @@ def train_shared_models(shared_ab, shared_ac, shared_ad, train_loader, device, n
         print(f"Epoch [{epoch+1}/{num_epochs}] - Shared Models Loss: {loss_ab.item():.4f}, {loss_ac.item():.4f}, {loss_ad.item():.4f}")
 
     # export hidden outs
-    torch.save(torch.cat(hidden_outputs_ab, dim=0), "hidden_outputs_ab.pt")
-    torch.save(torch.cat(hidden_outputs_ac, dim=0), "hidden_outputs_ac.pt")
-    torch.save(torch.cat(hidden_outputs_ad, dim=0), "hidden_outputs_ad.pt")
+    torch.save(torch.cat(hidden_outputs_ab, dim=0), "./resources/hidden_outputs/hidden_outputs_ab.pt")
+    torch.save(torch.cat(hidden_outputs_ac, dim=0), "./resources/hidden_outputs/hidden_outputs_ac.pt")
+    torch.save(torch.cat(hidden_outputs_ad, dim=0), "./resources/hidden_outputs/hidden_outputs_ad.pt")
     torch.save(torch.cat(labels_list, dim=0), "labels.pt")
 
     print("Hidden outputs and labels saved!")
 
 def load_and_split_data(test_ratio=0.2):
-    h_ab = torch.load("hidden_outputs_ab.pt")
-    h_ac = torch.load("hidden_outputs_ac.pt")
-    h_ad = torch.load("hidden_outputs_ad.pt")
+    h_ab = torch.load("./resources/hidden_outputs/hidden_outputs_ab.pt")
+    h_ac = torch.load("./resources/hidden_outputs/hidden_outputs_ac.pt")
+    h_ad = torch.load("./resources/hidden_outputs/hidden_outputs_ad.pt")
     labels = torch.load("labels.pt")
 
     hidden_inputs = torch.cat((h_ab, h_ac, h_ad), dim=1)
@@ -183,5 +183,8 @@ def main():
     print("Evaluating Global Model...")
     evaluate_global_model(global_model, test_data, test_labels, device)
 
+# TODO: compare time perspective of retraining the whole federation vs only the global model
+# TODO: log usage of resources
+# TODO: non IID case?
 if __name__ == "__main__":
     main()
