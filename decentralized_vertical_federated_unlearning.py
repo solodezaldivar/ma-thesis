@@ -304,16 +304,19 @@ def train_distilled(teacher_model, train_loader, device, temperature=2.0, num_ep
     print("Student model trained using knowledge distillation (removing memroy of m2).")
     return student_model
 
+
 ############################### Aggregate fc_out Weights from Shared Models ###############################
 def aggregate_fc_out_weights(state_dicts):
     weights = [sd['fc_out.weight'] for sd in state_dicts]
-    biases  = [sd['fc_out.bias'] for sd in state_dicts]
+    biases = [sd['fc_out.bias'] for sd in state_dicts]
     aggregated_weight = torch.stack(weights).mean(dim=0)
     aggregated_bias = torch.stack(biases).mean(dim=0)
     return aggregated_weight, aggregated_bias
 
+
 ###################################### Fine-Tuning Global Model on Raw MNIST Data ######################################
-def train_global_model(global_model, train_loader, device, num_epochs=1):
+def train_global_model(global_model: GlobalModel, train_loader, device, num_epochs=1):
+    global_model_cpu = 0
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(global_model.parameters(), lr=0.001)
     global_model.to(device)
@@ -330,12 +333,14 @@ def train_global_model(global_model, train_loader, device, num_epochs=1):
             loss.backward()
             optimizer.step()
         epoch_time = time.time() - start_time
-        track_resource_usage(epoch, "Global Model Training")
-        print(f"Global Epoch [{epoch+1}/{num_epochs}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
-    return global_model
+        global_model_cpu += track_resource_usage(epoch, "Global Model Training")
+        print(f"Global Epoch [{epoch + 1}/{num_epochs}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
+    return global_model, global_model_cpu
+
 
 ######################################### Evaluation #########################################
-def evaluate_model(global_model, test_loader, device, shared_models=None, unlearning_step=False):
+def evaluate_model(global_model: GlobalModel, test_loader: DataLoader, device, shared_models=None,
+                   unlearning_step=False):
     global_model.eval()
     all_preds, all_targets = [], []
     with torch.no_grad():
@@ -361,38 +366,33 @@ def evaluate_model(global_model, test_loader, device, shared_models=None, unlear
 
 
 ###################################### Fine-Tuning Global Model on Remaining Data #####################################
-def fine_tune_on_remaining_data(global_model, train_loader, forgotten_labels, device, num_epochs=5):
-    print(f"Fine-tuning global model on remaining clients, excluding labels: {forgotten_labels}")
-    
-    for param in global_model.fc2.parameters():
+def fine_tune_on_remaining_data(global_model, train_loader, device, num_epochs=5):
+    print(f"Fine-tuning global model on remaining parties")
+    cpu_mem_fine_tune = 0
+    for param in global_model.fc_out.parameters():
         param.requires_grad = False
-    
-    
+
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(global_model.parameters(), lr=0.001)
     global_model.to(device)
     global_model.train()
-    
+
     for epoch in range(num_epochs):
         start_time = time.time()
         for inputs, labels in train_loader:
-            # Exclude data corresponding to the forgotten labels
-            mask = ~torch.isin(labels, torch.tensor(forgotten_labels).to(device))
-            inputs, labels = inputs[mask], labels[mask]
-
             if inputs.shape[0] == 0:  # Skip batch if empty after filtering
                 continue
 
             inputs, labels = inputs.to(device), labels.to(device)
             inputs = inputs
-            # Remove forgotten feature m2 (196:392)
+
             inputs = torch.cat((inputs[:, :196], inputs[:, 392:]), dim=1)  # Keep only m1, m3, and m4
             optimizer.zero_grad()
             outputs = global_model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-        
+
         epoch_time = time.time() - start_time
         print(f"Fine-tune Epoch [{epoch+1}/{num_epochs}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
     
@@ -432,25 +432,28 @@ def forget_shared_model_avg(forget_name, shared_models, train_loader, device, nu
     print("Global model fc_out updated using direct average of remaining shared models after unlearning", forget_name)
     # finetune is done in separate step
     return new_global_model
+        cpu_mem_fine_tune += track_resource_usage(epoch, "Fine-Tuned Global Model Training")
+        print(f"Fine-tune Epoch [{epoch + 1}/{num_epochs}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
+
+    return global_model, cpu_mem_fine_tune
 
 
 ############################### Forget step direct ###############################
 def forget_shared_model_direct(forget_name, shared_models, device):
-    # Define the names of the shared models
     all_names = ["shared_ab", "shared_ac", "shared_ad"]
-    
-    # Select only the remaining models
+
     remaining_models = []
     for name, model in zip(all_names, shared_models):
         if name != forget_name:
             remaining_models.append(model)
-    
+
+    print(f"Remaining models after forgetting {forget_name}: {len(remaining_models)}")
     if len(remaining_models) == 0:
         print("No remaining models available. Cannot unlearn.")
         return None
 
-    # Aggregate the fc_out weights and biases from the remaining models
-    remaining_state_dicts = [sm.state_dict() for sm in remaining_models]
+    # aggregate fc_out weights and biases from the remaining models
+    remaining_state_dicts = [sm[0].state_dict() for sm in remaining_models]
     new_agg_weight, new_agg_bias = aggregate_fc_out_weights(remaining_state_dicts)
     
     # Create a new GlobalModel with updated input size
@@ -460,78 +463,117 @@ def forget_shared_model_direct(forget_name, shared_models, device):
     new_global_model.fc2.weight.data.copy_(new_agg_weight)
     new_global_model.fc2.bias.data.copy_(new_agg_bias)
     
+
+    # new GlobalModel with updated input size
+    new_global_model = GlobalModel(input_size=588, hidden_size=260, num_classes=10).to(device)
+
+    new_global_model.fc_out.weight.data.copy_(new_agg_weight)
+    new_global_model.fc_out.bias.data.copy_(new_agg_bias)
+
     print("Global model fc_out updated using direct average of remaining shared models after unlearning", forget_name)
     return new_global_model
 
+
+def compare_state_dicts(model1, model2, atol=1e-6, rtol=1e-5):
+    state_dict1 = model1.state_dict()
+    state_dict2 = model2.state_dict()
+
+    keys1 = set(state_dict1.keys())
+    keys2 = set(state_dict2.keys())
+
+    # Check if both models have the same keys.
+    if keys1 != keys2:
+        print("The models have different state_dict keys!")
+        print("Keys only in model1:", keys1 - keys2)
+        print("Keys only in model2:", keys2 - keys1)
+    else:
+        print("Both models have the same state_dict keys.")
+
+    differences = {}
+
+    # Iterate over each key and compare the tensors.
+    for key in keys1:
+        tensor1 = state_dict1[key]
+        tensor2 = state_dict2[key]
+
+        if tensor1.shape != tensor2.shape:
+            differences[key] = f"Different shapes: {tensor1.shape} vs {tensor2.shape}"
+        else:
+            if not torch.allclose(tensor1, tensor2, atol=atol, rtol=rtol):
+                max_diff = (tensor1 - tensor2).abs().max().item()
+                differences[key] = f"Max absolute difference: {max_diff:.6f}"
+
+    if differences:
+        print("Differences found in the following parameters:")
+        for key, diff in differences.items():
+            print(f"{key}: {diff}")
+    else:
+        print("All parameters are equal within the given tolerance.")
+
+    return differences
+
+
 ############################################ Main Process ############################################
-def main():
+def dvfu_framework(scenario: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x.view(-1))  # Flatten to 784
     ])
-    
+
     train_dataset = datasets.MNIST(root='./data', train=True, transform=transform, download=True)
-    test_dataset  = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
-    
-    # train_dataset = datasets.FMNIST(root='./data', train=True, transform=transform, download=True)
-    # test_dataset  = datasets.FMNIST(root='./data', train=False, transform=transform, download=True)
-    
+    test_dataset = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # Initialize three shared models.
-    shared_ab = SharedModel()  # m1 and m2
-    shared_ac = SharedModel()  # m1 and m3
-    shared_ad = SharedModel()  # m1 and m4
+    dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
 
-    print("Training SharedModels")
-    shared_ab, shared_ac, shared_ad = train_shared_models(shared_ab, shared_ac, shared_ad, train_loader, device, num_epochs=5, use_nonIID=IID)
-    
-    # Aggregate the fc_out weights from the shared models.
-    state_dicts = [shared_ab.state_dict(), shared_ac.state_dict(), shared_ad.state_dict()]
+    # partition the dataset into 4 disjoint subsets
+    dataloaders = get_data_loader(dataset, label_spec_extreme_non_iid, scenario)
+
+    # Initialize three shared models.
+    shared_ab, shared_ac, shared_ad, total_cpu_usage_sm = get_shared_models(dataloaders, device)
+
+    print("SharedModels training complete.")
+    # compare_state_dicts(shared_ab[0], shared_ab[1])
+    # compare_state_dicts(shared_ac[0], shared_ac[1])
+    # compare_state_dicts(shared_ad[0], shared_ad[1])    
+
+    state_dicts = [shared_ab[0].state_dict(), shared_ac[0].state_dict(), shared_ad[0].state_dict()]
     agg_weight, agg_bias = aggregate_fc_out_weights(state_dicts)
     print("\nAggregated fc_out weights shape:", agg_weight.shape)
-    
-    global_model = GlobalModel(input_size=784, hidden_size=261, num_classes=10)
-    # Initialize global model's fc2 (classifier) with the aggregated fc_out weights.
-    global_model.fc2.weight.data.copy_(agg_weight)
-    global_model.fc2.bias.data.copy_(agg_bias)
-    print("Global model fc_out initialized with aggregated shared model fc_out weights.")
-    
-    # Fine-tune GlobalModel on raw MNIST training data.
-    print("\nFine-tuning Global Model on raw MNIST training data...")
-    train_global_model(global_model, train_loader, device, num_epochs=5)
-    
-    # Evaluate GlobalModel on test data.
-    print("\nEvaluating Global Model on MNIST test data...")
-    acc_before, f1_before, report_before = evaluate_model(global_model, test_loader, device, [shared_ab, shared_ac, shared_ad], unlearning_step=False)
-    
+
+    global_model = create_global_model_agg_weights(agg_bias, agg_weight)
+
+    print("Fine-tuning Global Model on raw %s training data" % MNIST)
+    global_model, cpu = train_global_model(global_model, train_loader, device, num_epochs=5)
+
+    print("\nEvaluating Global Model on %s test data..." % MNIST)
+    acc_before, f1_before, report_before = evaluate_model(global_model, test_loader, device,
+                                                          [shared_ab, shared_ac, shared_ad], unlearning_step=False)
+
     # print("Running Unlearning Verification before Forgetting...")
     loss_before = membership_inference_attack(global_model, train_loader)
     confi_forgotten_before, confi_unseen_before = confidence_score_difference(global_model, train_loader, test_loader)
     mia_acc_before = adversarial_mia_attack(global_model, train_loader, test_loader, device)
-    
-    
+
     # Now simulate unlearning: Forget one shared model (e.g. "shared_ab")
     print("\nUnlearning: Removing shared model 'shared_ab'...")
+
+    # Unlearning
     remaining_shared_models = [shared_ab, shared_ac, shared_ad]
-    
-    
-    # In our simulation, remove the one named "shared_ab"
-    # new_global_model = forget_shared_model_avg("shared_ab", remaining_shared_models, train_loader, device, num_epochs_global=5)
-    
+
     new_global_model = forget_shared_model_direct("shared_ab", remaining_shared_models, device)
     if new_global_model is not None:
-        # knowledge distillation
-        new_global_model = fine_tune_on_remaining_data(new_global_model, train_loader, forgotten_labels=[5], device=device, num_epochs=5)
-
+        new_global_model, cpu_fine_tune = fine_tune_on_remaining_data(new_global_model, train_loader,
+                                                                      device=device, num_epochs=5)
 
         # global_model = train_distilled(new_global_model, train_loader, device, temperature=2.0, num_epochs=5)
-                
+
         print("\nEvaluating Global Model after unlearning 'shared_ab'...")
-        acc_after, f1_after, report_after = evaluate_model(new_global_model, test_loader, device, None, unlearning_step=True)
-        
+        acc_after, f1_after, report_after = evaluate_model(new_global_model, test_loader, device, None,
+                                                           unlearning_step=True)
         print("Running Unlearning Verification after Forgetting...")
         loss_after = membership_inference_attack(new_global_model, train_loader, unlearning_step=True)
         confi_forgotten_after, confi_unseen_after = confidence_score_difference(new_global_model, train_loader,
@@ -614,16 +656,7 @@ def get_data_loader(dataset, label_spec_scenario, scenario=None):
 
 if __name__ == "__main__":
     start_time = time.time()
-    main()
+    dvfu_framework(IID_CASE)
     total_time = time.time() - start_time
     track_resource_usage(0, "Complete Execution")
     print(f"Total execution time: {total_time:.2f} seconds")
-
-
-
-# # To investigate further, you could:
-
-# # Enable more aggressive unlearning: Try weighting the aggregation so that the forgotten model’s weights are entirely removed rather than averaged in.
-# # Check the global model’s classifier parameters: Compare the aggregated weights before and after unlearning to see if there is a significant change.
-# # Monitor label-specific metrics: Look specifically at precision, recall, and F1 for label 5 during unlearning to see if they change over time.
-# # In summary, if label 5 performance isn’t dropping as expected, it could be due to the way the unlearning is implemented (averaging dilutes the effect) or because the global model is compensating during fine‑tuning. You might need a more aggressive or targeted unlearning strategy to see a significant drop.
