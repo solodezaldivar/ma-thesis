@@ -59,42 +59,39 @@ label_spec_normal_non_iid = {
 label_spec_even_iid = None
 
 ########################################### Model Definitions ###########################################
-class LocalModel(nn.Module):
-    def __init__(self, input_size=196, hidden_size=260, num_classes=10):
-        super(LocalModel, self).__init__()
-        self.fc = nn.Linear(hidden_size, num_classes)
-
-
 class SharedModel(nn.Module):
-    def __init__(self, input_size=392, hidden_size=261, num_classes=10):  
+    def __init__(self, input_size=392, hidden_size=130, num_classes=10):
         super(SharedModel, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.ReLU()  # non-inplace
+        self.relu = nn.ReLU()
+        self.fc_out = nn.Linear(hidden_size * 2, num_classes)
+
+    def forward(self, x):
+        return self.relu(self.fc1(x))
+
+    def predict(self, concatenated_hidden):
+        return self.fc_out(concatenated_hidden)
+
+
+class GlobalModel(nn.Module):
+    def __init__(self, input_size=784, hidden_size=260, num_classes=10):
+        super(GlobalModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.relu = nn.ReLU()
         self.fc_out = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
-        hidden_output = self.relu(self.fc1(x))
-        classification_output = self.fc_out(hidden_output)
-        return hidden_output, classification_output
-
-class GlobalModel(nn.Module):
-    def __init__(self, input_size=784, hidden_size=261, num_classes=10):
-        super(GlobalModel, self).__init__()
-        # Global model takes input from concatenating outputs from n shared models.
-        # Its fc1 expects input size = hidden_size * 3.
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, num_classes)
-
-    def forward(self, x):
         x = self.relu(self.fc1(x))
-        return self.fc2(x)
-    
+        return self.fc_out(x)
+
+
 ############################################ Tracking Resources ############################################
 def track_resource_usage(epoch, phase="Training"):
     cpu_mem = psutil.virtual_memory().used / (1024 ** 3)
     gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0
-    print(f"[{phase} - Epoch {epoch+1}] CPU Memory: {cpu_mem:.2f} GB, GPU Memory: {gpu_mem:.2f} GB")
+    print(f"[{phase} - Epoch {epoch + 1}] CPU Memory: {cpu_mem:.2f} GB, GPU Memory: {gpu_mem:.2f} GB")
+    return cpu_mem
+
 
 ######################################## Data Preprocessing: Non-IID or IID ########################################
 def force_batch_size(tensor, target_size):
@@ -127,7 +124,7 @@ def confidence_score_difference(global_model, train_loader, test_loader, unlearn
     with torch.no_grad():
         train_data, _ = next(iter(train_loader))
         test_data, _ = next(iter(test_loader))
-        
+
         if unlearning_step:
             train_data = torch.cat((train_data[:, :196], train_data[:, 392:]), dim=1)  # Keep only m1, m3, and m4
             test_data = torch.cat((test_data[:, :196], test_data[:, 392:]), dim=1)  # Keep only m1, m3, and m4
@@ -177,7 +174,7 @@ def adversarial_mia_attack(global_model, train_loader, test_loader, device, num_
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-    
+
     attack_model.eval()
     with torch.no_grad():
         attack_predictions = (attack_model(attack_data.to(device)) > 0.5).float().cpu()
@@ -195,89 +192,122 @@ def generate_hidden_outputs(models, data, device):
     return hidden_outputs
 
 
+def train_shared_models(models, device, train_loaders, optimizers, epoch_total, input_size):
+    total_resources_shared_model_training = 0
+    for model in models:
+        model.train()
+    for i, dataloader in enumerate(train_loaders):
+        for epoch in range(0, epoch_total):
+            start_time = time.time()
 
-# DevertiFL Shared Model Training
+            for batch_idx, (data, target) in enumerate(dataloader):
+                batch_start_time = time.time()
+                data, target = data.to(device), target.to(device)
+                data = data.view(data.size(0),
+                                 -1)  # We flatten the image into a single vector, preserving the zero values for non-responsible features
 
-def selective_exchange_local_gradients(shared_model):
-    """
-    Averages the gradients of corresponding parameters between the two local models
-    inside a single shared model. This encourages both local models to update
-    in a coordinated manner.
-    """
-    params_m1 = list(shared_model.local_model_m1.parameters())
-    params_other = list(shared_model.local_model_other.parameters())
-    
-    for p1, p2 in zip(params_m1, params_other):
-        if p1.grad is not None and p2.grad is not None:
-            avg_grad = (p1.grad.data + p2.grad.data) / 2.0
-            p1.grad.data.copy_(avg_grad.clone())
-            p2.grad.data.copy_(avg_grad.clone())
+                hidden_outputs = generate_hidden_outputs(models, data, device)
+
+                combined_hidden_outputs = torch.cat(hidden_outputs, dim=1)
+
+                # For Backpropagation loss sharing mechanism, we first append the loss from each model
+                losses = []
+                for i, model in enumerate(models):
+                    output = model.predict(combined_hidden_outputs)
+                    loss = nn.CrossEntropyLoss()(output, target)
+                    losses.append(loss)
+
+                # Next we share the backpropagation loss
+                total_loss = sum(losses)  # The sum of all losses is shared
+                total_loss.backward()
+
+                # Next up, need to update the model with these shared gradients
+                for i, model in enumerate(models):
+                    optimizer = optimizers[i]
+                    optimizer.step()
+                    optimizer.zero_grad()
+            epoch_time = time.time() - start_time
+            total_resources_shared_model_training += track_resource_usage(epoch_time, "Shared Models Training")
+            print(f"Shared Model [{epoch + 1}/{epoch_total}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
+    return models, total_resources_shared_model_training
 
 
-def train_shared_models_from_locals(shared_models, train_loader, device, num_epochs=5):
-    """
-    Trains the list of shared models.
-    Each input image is split into four segments:
-      m1: features [0:196]
-      m2: features [196:392]
-      m3: features [392:588]
-      m4: features [588:784]
-    
-    The three shared models are trained as:
-      - shared_models[0]: receives (m1, m2)
-      - shared_models[1]: receives (m1, m3)
-      - shared_models[2]: receives (m1, m4)
-    
-    After backpropagation, gradients are selectively exchanged between the
-    two local models in each shared model.
-    """
-    for model in shared_models:
-        model.to(device)
-    optimizers = [optim.Adam(model.parameters(), lr=0.001) for model in shared_models]
-    criterion = nn.CrossEntropyLoss()
-    
-    for epoch in range(num_epochs):
-        start_time = time.time()
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            # Split the flattened image into four parts
-            m1 = images[:, :196]
-            m2 = images[:, 196:392]
-            m3 = images[:, 392:588]
-            m4 = images[:, 588:]
-            
-            # Forward pass through each shared model:
-            output1 = shared_models[0](m1, m2)  # SharedModel1: (m1, m2)
-            output2 = shared_models[1](m1, m3)  # SharedModel2: (m1, m3)
-            output3 = shared_models[2](m1, m4)  # SharedModel3: (m1, m4)
-            
-            loss1 = criterion(output1, labels)
-            loss2 = criterion(output2, labels)
-            loss3 = criterion(output3, labels)
-            total_loss = loss1 + loss2 + loss3
-            
-            # Zero gradients for each optimizer
-            for opt in optimizers:
-                opt.zero_grad()
-            
-            # Backward pass
-            total_loss.backward()
-            
-            # Within each shared model, exchange gradients between its two local models.
-            for model in shared_models:
-                selective_exchange_local_gradients(model)
-            
-            # Update parameters
-            for opt in optimizers:
-                opt.step()
-                
-        epoch_time = time.time() - start_time
-        print(f"Epoch [{epoch+1}/{num_epochs}] - Time: {epoch_time:.2f}s, Total Loss: {total_loss.item():.4f}")
-    
-    return shared_models
-            
+# Function to safely initialize or get gradients - Code from DevertiFL repo
+def safe_gradient(parameter):
+    if parameter.grad is not None:
+        return parameter.grad.data
+    else:
+        return torch.zeros_like(parameter.data)
 
-############################################  Knowledge Distillation ############################################
+
+# Selective gradient exchange function - Code from DevertiFL repo
+def selective_exchange_gradients(models, hidden_size):
+    num_models = len(models)
+    total_hidden_size = hidden_size * num_models
+    param_indices = [0]
+    cumulative_index = 0
+    for i in range(num_models):
+        cumulative_index += total_hidden_size
+        param_indices.append(cumulative_index)
+
+    for seg in range(num_models):
+        start = param_indices[seg]
+        end = param_indices[seg + 1]
+        for param_idx in range(start, end):
+            grads = []
+            for model in models:
+                model_params = list(model.parameters())
+                if param_idx < len(model_params) and model_params[param_idx].grad is not None:
+                    grads.append(model_params[param_idx].grad)
+            if grads:
+                avg_grad = torch.stack(grads).mean(dim=0)
+                for model in models:
+                    model_params = list(model.parameters())
+                    if param_idx < len(model_params):
+                        model_params[param_idx].grad = avg_grad.clone()
+    final_start = param_indices[-1]
+    if final_start < len(list(models[0].parameters())):
+        for param_idx in range(final_start, len(list(models[0].parameters()))):
+            grads = []
+            for model in models:
+                model_params = list(model.parameters())
+                if param_idx < len(model_params) and model_params[param_idx].grad is not None:
+                    grads.append(model_params[param_idx].grad)
+            if grads:
+                avg_grad = torch.stack(grads).mean(dim=0)
+                for model in models:
+                    if param_idx < len(list(model.parameters())):
+                        list(model.parameters())[param_idx].grad = avg_grad.clone()
+
+
+def partition_dataset(dataset, num_partitions, batch_size=500, shuffle=True, fixed_size=392, label_spec=None):
+    sample, _ = dataset[0]
+    feature_dim = sample.numel()
+    partition_size = feature_dim // num_partitions
+
+    dataloaders = []
+    for i in range(num_partitions):
+        start = i * partition_size
+
+        end = (i + 1) * partition_size if i < num_partitions - 1 else feature_dim
+        partition_samples = []
+        for data, label in dataset:
+            if label_spec is not None and i in label_spec:
+                target_label, keep_prob = label_spec[i]
+                if label == target_label:
+                    if np.random.rand() > keep_prob:  # only include sample with probability keep_prob.
+                        continue
+            new_data = torch.zeros(fixed_size, dtype=data.dtype)  # fixed to match input size of shared model
+            slice_data = data[start:end]
+            new_data[:slice_data.numel()] = slice_data
+            partition_samples.append((new_data, label))
+
+        dataloader = DataLoader(partition_samples, batch_size=batch_size, shuffle=shuffle)
+        dataloaders.append(dataloader)
+    return dataloaders
+
+
+############################################  Knowledge Distillation (WIP) ############################################
 def train_distilled(teacher_model, train_loader, device, temperature=2.0, num_epochs=5):
     student_model = GlobalModel(input_size=588, hidden_size=261, num_classes=10)
     optimizer = optim.Adam(student_model.parameters(), lr=0.001)
