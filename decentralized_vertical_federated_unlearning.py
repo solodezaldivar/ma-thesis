@@ -21,7 +21,6 @@ from plotting import plot_unlearning_findings, plot_report_diff
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-
 ########################################### Data Loading ###########################################
 # Fashion-MNIST data
 def load_fashion_mnist_data():
@@ -37,8 +36,27 @@ def load_fashion_mnist_data():
 ########################################### Constants ###########################################
 BATCH_SIZE = 500
 PARTIES = 4
-IID = True
+non_IID = False
+EXTREME_NON_IID_CASE = "extreme non-IID Case"
+NON_IID_CASE = "non-IID Case"
+IID_CASE = "IID Case"
+MNIST = "MNIST"
 
+label_spec_extreme_non_iid = {
+    0: (5, 0.0),
+    1: (5, 1.0),
+    2: (5, 0.0),
+    3: (5, 0.0),
+}
+
+label_spec_normal_non_iid = {
+    0: (5, 0.1),
+    1: (5, 0.7),
+    2: (5, 0.0),
+    3: (5, 0.2),
+}
+
+label_spec_even_iid = None
 
 ########################################### Model Definitions ###########################################
 class LocalModel(nn.Module):
@@ -88,18 +106,6 @@ def force_batch_size(tensor, target_size):
         indices = torch.randint(0, tensor.size(0), (target_size,))
         return tensor[indices]
 
-def non_IID_partition_data_extreme(data, labels, batch_size=BATCH_SIZE):
-    number_to_forget = 5
-    seven_indices = (labels == number_to_forget).nonzero(as_tuple=True)[0]
-    non_seven_indices = (labels != number_to_forget).nonzero(as_tuple=True)[0]
-
-    # Extract data partitions
-    m2 = force_batch_size(data[seven_indices, 196:392], batch_size)  # Only '5' TODO -> 80% are 5 and 20% are all the other numbers (try with a less extreme scenario where 50% are 5 and 50% are all the other numbers)
-    m1 = force_batch_size(data[non_seven_indices, :196], batch_size)
-    m3 = force_batch_size(data[non_seven_indices, 392:588], batch_size)
-    m4 = force_batch_size(data[non_seven_indices, 588:], batch_size)
-    
-    return m1, m2, m3, m4, labels
 
 ################################# Unlearning Metrics #################################
 def membership_inference_attack(global_model, dataloader, unlearning_step=False):
@@ -114,6 +120,7 @@ def membership_inference_attack(global_model, dataloader, unlearning_step=False)
         loss = F.cross_entropy(logits, labels)
         print(f"Loss on forgotten client's data: {loss.item():.4f}")
         return loss.item()
+
 
 def confidence_score_difference(global_model, train_loader, test_loader, unlearning_step=False):
     global_model.eval()
@@ -149,17 +156,18 @@ def adversarial_mia_attack(global_model, train_loader, test_loader, device, num_
         else:
             client_data = client_data
             unseen_data = unseen_data
-        
+
         client_logits = global_model(client_data.float())
         unseen_logits = global_model(unseen_data.float())
     attack_data = torch.cat((client_logits, unseen_logits), dim=0)
     dataset = TensorDataset(attack_data, labels)
     dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
-    
-    attack_model = nn.Sequential(nn.Linear(attack_data.size(1), 128), nn.ReLU(), nn.Linear(128, 1), nn.Sigmoid()).to(device)
+
+    attack_model = nn.Sequential(nn.Linear(attack_data.size(1), 128), nn.ReLU(), nn.Linear(128, 1), nn.Sigmoid()).to(
+        device)
     optimizer = optim.Adam(attack_model.parameters(), lr=0.001)
     criterion = nn.BCELoss()
-    
+
     attack_model.train()
     for epoch in range(num_epochs):
         for inputs, labels in dataloader:
@@ -178,60 +186,13 @@ def adversarial_mia_attack(global_model, train_loader, test_loader, device, num_
     return attack_acc
 
 
-############################################ Split into Local Models ############################################
-def split_into_local_models(mnist_data, labels, nonIID=False):
-    if nonIID:
-       return non_IID_partition_data_extreme(mnist_data, labels)
-    m1 = mnist_data[:, :196]  
-    m2 = mnist_data[:, 196:392]  
-    m3 = mnist_data[:, 392:588]  
-    m4 = mnist_data[:, 588:]
-    return m1, m2, m3, m4, labels
-
-
-######################################## Training Utilities for Shared Models ########################################
-def train_shared_models(shared_ab, shared_ac, shared_ad, train_loader, device, num_epochs=5, use_nonIID=False):
-    shared_ab.to(device)
-    shared_ac.to(device)
-    shared_ad.to(device)
-    optimizer_ab = optim.Adam(shared_ab.parameters(), lr=0.001)
-    optimizer_ac = optim.Adam(shared_ac.parameters(), lr=0.001)
-    optimizer_ad = optim.Adam(shared_ad.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss()
-    # TODO: VertiFL for the shared models
-    for epoch in range(num_epochs):
-        start_time = time.time()
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            m1, m2, m3, m4, labels = split_into_local_models(images, labels, use_nonIID)
-            labels = labels[:BATCH_SIZE]
-        
-            input_ab = torch.cat((m1, m2), dim=1).to(device)
-            input_ac = torch.cat((m1, m3), dim=1).to(device)
-            input_ad = torch.cat((m1, m4), dim=1).to(device)
-            
-            _, pred_ab = shared_ab(input_ab)
-            _, pred_ac = shared_ac(input_ac)
-            _, pred_ad = shared_ad(input_ad)
-            
-            loss_ab = criterion(pred_ab, labels)
-            loss_ac = criterion(pred_ac, labels)
-            loss_ad = criterion(pred_ad, labels)
-            
-            optimizer_ab.zero_grad()
-            loss_ab.backward()
-            optimizer_ab.step()
-            optimizer_ac.zero_grad()
-            loss_ac.backward()
-            optimizer_ac.step()
-            optimizer_ad.zero_grad()
-            loss_ad.backward()
-            optimizer_ad.step()
-        
-        epoch_time = time.time() - start_time
-        track_resource_usage(epoch, "Shared Model Training")
-        print(f"Epoch [{epoch+1}/{num_epochs}] - Time: {epoch_time:.2f}s, Losses: {loss_ab.item():.4f}, {loss_ac.item():.4f}, {loss_ad.item():.4f}")
-    return shared_ab, shared_ac, shared_ad
+################################## DevertiFL Shared Model Training ##################################
+def generate_hidden_outputs(models, data, device):
+    hidden_outputs = []
+    for model in models:
+        hidden_output = model(data.to(device))
+        hidden_outputs.append(hidden_output)
+    return hidden_outputs
 
 
 
@@ -381,22 +342,10 @@ def evaluate_model(global_model, test_loader, device, shared_models=None, unlear
         for data, labels in test_loader:
             data = data.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            # sm_raw_out = None
-            # m1, m2, m3, m4 = split_into_local_models(data, labels)
-            # for i, sm in enumerate(shared_models):
-            #     if sm_raw_out is None:
-            #         sm_raw_out = sm(torch.cat((m1, m2), dim=1))[0].clone()
-            #         print("sm_raw_out.shape:", sm_raw_out.shape)
-            #     elif i == 1:
-            #         inp = torch.cat((m1, m3), dim=1)
-            #         sm_raw_out = torch.cat((sm_raw_out, sm(inp)[0].clone()), dim=1)
-            #     elif i == 2:
-            #         inp = torch.cat((m1, m4), dim=1)
-            #         sm_raw_out = torch.cat((sm_raw_out, sm(inp)[0].clone()), dim=1)
             if not unlearning_step:
                 outputs = global_model(data)
             else:
-                data = torch.cat((data[:, :196], data[:, 392:]), dim=1)  # Keep only m1, m3, and m4
+                data = torch.cat((data[:, :196], data[:, 392:]), dim=1)  # keep only m1, m3, and m4
                 outputs = global_model(data)
             _, predicted = torch.max(outputs, 1)
             all_preds.extend(predicted.cpu().numpy())
@@ -585,11 +534,83 @@ def main():
         
         print("Running Unlearning Verification after Forgetting...")
         loss_after = membership_inference_attack(new_global_model, train_loader, unlearning_step=True)
-        confi_forgotten_after, confi_unseen_after = confidence_score_difference(new_global_model, train_loader, test_loader, unlearning_step=True)
-        mia_acc_after = adversarial_mia_attack(new_global_model, train_loader, test_loader, device, unlearning_step=True)
-        
-        plot_report_diff(report_before, report_after, "MNIST")
-        plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, confi_forgotten_after, confi_unseen_before, confi_unseen_after, mia_acc_before, mia_acc_after)
+        confi_forgotten_after, confi_unseen_after = confidence_score_difference(new_global_model, train_loader,
+                                                                                test_loader, unlearning_step=True)
+        mia_acc_after = adversarial_mia_attack(new_global_model, train_loader, test_loader, device,
+                                               unlearning_step=True)
+
+        total_cpu_usage_sm += cpu_fine_tune + cpu
+        print(f"Total CPU Usage: {total_cpu_usage_sm} GB")
+        if scenario == EXTREME_NON_IID_CASE:
+            plot_report_diff(report_before, report_after, MNIST, EXTREME_NON_IID_CASE)
+            plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, confi_forgotten_after,
+                                     confi_unseen_before, confi_unseen_after, mia_acc_before, mia_acc_after,
+                                     MNIST,
+                                     EXTREME_NON_IID_CASE)
+            # plot_resource_comparison(360.287, 51.64, 210.339, 29.06, MNIST, EXTREME_NON_IID_CASE)
+        elif scenario == NON_IID_CASE:
+            plot_report_diff(report_before, report_after, MNIST, NON_IID_CASE)
+            plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, confi_forgotten_after,
+                                     confi_unseen_before, confi_unseen_after, mia_acc_before, mia_acc_after,
+                                     MNIST,
+                                     NON_IID_CASE)
+            # plot_resource_comparison(360.287, 51.64, 210.339, 29.06, MNIST, NON_IID_CASE)
+
+        else:
+            plot_report_diff(report_before, report_after, MNIST, IID_CASE)
+            plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, confi_forgotten_after,
+                                     confi_unseen_before, confi_unseen_after, mia_acc_before, mia_acc_after,
+                                     MNIST,
+                                     IID_CASE)
+            # plot_resource_comparison(360.287, 51.64, 210.339, 29.06, MNIST, NON_IID_CASE)
+
+
+
+def create_global_model_agg_weights(agg_bias, agg_weight):
+    global_model = GlobalModel(input_size=784, hidden_size=260, num_classes=10)
+    global_model.fc_out.weight.data.copy_(agg_weight)
+    global_model.fc_out.bias.data.copy_(agg_bias)
+    print("Global model fc_out initialized with aggregated shared model fc_out weights.")
+    return global_model
+
+
+def get_shared_models(dataloaders, device, federated_rounds=5):
+    shared_ab = [SharedModel(), SharedModel()]  # m1 and m2
+    shared_ac = [SharedModel(), SharedModel()]  # m1 and m3
+    shared_ad = [SharedModel(), SharedModel()]  # m1 and m4
+    total_resources_shared_model_training = 0
+    print("Training SharedModels Deverti-FL Style")
+
+    for federated_round in range(federated_rounds):
+        start_time = time.time()
+        shared_ab, total_resource_ab = train_shared_models(shared_ab, device, [dataloaders[0], dataloaders[1]],
+                                                           [optim.Adam(sm.parameters(), lr=0.001) for sm in shared_ab], 5,
+                                                           196)
+        shared_ac, total_resource_ac = train_shared_models(shared_ac, device, [dataloaders[0], dataloaders[2]],
+                                                           [optim.Adam(sm.parameters(), lr=0.001) for sm in shared_ac], 5,
+                                                           196)
+        shared_ad, total_resource_ad = train_shared_models(shared_ad, device, [dataloaders[0], dataloaders[3]],
+                                                           [optim.Adam(sm.parameters(), lr=0.001) for sm in shared_ad], 5,
+                                                           196)
+        total_resources_shared_model_training += total_resource_ab + total_resource_ac + total_resource_ad
+        selective_exchange_gradients(shared_ab, 260)
+        selective_exchange_gradients(shared_ac, 260)
+        selective_exchange_gradients(shared_ad, 260)
+        federated_round_time = time.time() - start_time
+        print(f"Federated Rounds [{federated_round + 1}/{federated_rounds}] - Time: {federated_round_time:.2f}s, Resource Consumption: {total_resources_shared_model_training:.4f} GB")
+
+    return shared_ab, shared_ac, shared_ad, total_resources_shared_model_training
+
+
+def get_data_loader(dataset, label_spec_scenario, scenario=None):
+    if scenario == EXTREME_NON_IID_CASE:
+        dataloaders = partition_dataset(dataset, 4, 500, True, 392, label_spec_scenario)
+    elif scenario == NON_IID_CASE:
+        dataloaders = partition_dataset(dataset, 4, 500, True, 392, label_spec_scenario)
+    else:
+        dataloaders = partition_dataset(dataset, 4, 500, True, 392)
+    return dataloaders
+
 
 if __name__ == "__main__":
     start_time = time.time()
