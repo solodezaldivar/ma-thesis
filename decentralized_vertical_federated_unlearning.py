@@ -16,7 +16,7 @@ from collections import Counter
 import torch.nn.functional as F
 import warnings
 import matplotlib.pyplot as plt
-from plotting import plot_unlearning_findings, plot_report_diff
+from plotting import plot_unlearning_findings, plot_report_diff, plot_resource_comparison
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -309,25 +309,24 @@ def partition_dataset(dataset, num_partitions, batch_size=500, shuffle=True, fix
 
 ############################################  Knowledge Distillation (WIP) ############################################
 def train_distilled(teacher_model, train_loader, device, temperature=2.0, num_epochs=5):
-    student_model = GlobalModel(input_size=588, hidden_size=261, num_classes=10)
+    student_model = GlobalModel(input_size=588, hidden_size=260, num_classes=10)
     optimizer = optim.Adam(student_model.parameters(), lr=0.001)
     criterion = nn.KLDivLoss(reduction='batchmean')
-    
+
     teacher_model.eval()
     student_model.train()
-    
+
     for epoch in range(num_epochs):
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             inputs = inputs
             inputs = torch.cat((inputs[:, :196], inputs[:, 392:]), dim=1)  # Keep only m1, m3, and m4
 
-            
             with torch.no_grad():
                 teacher_logits = teacher_model(inputs) / temperature
             student_logits = student_model(inputs)
             loss = criterion(F.log_softmax(student_logits / temperature, dim=1), F.softmax(teacher_logits, dim=1))
-            
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -424,44 +423,6 @@ def fine_tune_on_remaining_data(global_model, train_loader, device, num_epochs=5
             optimizer.step()
 
         epoch_time = time.time() - start_time
-        print(f"Fine-tune Epoch [{epoch+1}/{num_epochs}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
-    
-    return global_model
-
-############################### forget step with subtraction ###############################
-def forget_shared_model_avg(forget_name, shared_models, train_loader, device, num_epochs_global=5):
-    # Remove the shared model with name forget_name from the list.
-    all_names = ["shared_ab", "shared_ac", "shared_ad"]
-    remaining_models = []
-    forgotten_state = None
-    for name, model in zip(all_names, shared_models):
-        if name == forget_name:
-            forgotten_state = model.state_dict()
-        else:
-            remaining_models.append(model)
-        
-    if forgotten_state is None or len(remaining_models) == 0:
-        return None
-
-    orig_state_dicts = [sm.state_dict() for sm in shared_models]
-    orig_agg_weight, orig_agg_bias = aggregate_fc_out_weights(orig_state_dicts)
-    print("The error is here")
-    forgotten_weight = forgotten_state['fc_out.weight']
-    forgotten_bias = forgotten_state['fc_out.bias']
-    new_agg_weight = orig_agg_weight - forgotten_weight
-    new_agg_bias = orig_agg_bias - forgotten_bias
-    
-    diff = torch.norm(orig_agg_weight[5] - new_agg_weight[5]).item()
-    print(f"Norm of difference for label 5 weights: {diff:.4f}")
-
-    
-    # Create a new GlobalModel and initialize its fc_out using the new aggregate.
-    new_global_model = GlobalModel(input_size=588,hidden_size=261, num_classes=10)
-    new_global_model.fc2.weight.data.copy_(new_agg_weight)
-    new_global_model.fc2.bias.data.copy_(new_agg_bias)
-    print("Global model fc_out updated using direct average of remaining shared models after unlearning", forget_name)
-    # finetune is done in separate step
-    return new_global_model
         cpu_mem_fine_tune += track_resource_usage(epoch, "Fine-Tuned Global Model Training")
         print(f"Fine-tune Epoch [{epoch + 1}/{num_epochs}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
 
@@ -485,14 +446,6 @@ def forget_shared_model_direct(forget_name, shared_models, device):
     # aggregate fc_out weights and biases from the remaining models
     remaining_state_dicts = [sm[0].state_dict() for sm in remaining_models]
     new_agg_weight, new_agg_bias = aggregate_fc_out_weights(remaining_state_dicts)
-    
-    # Create a new GlobalModel with updated input size
-    new_global_model = GlobalModel(input_size=588, hidden_size=261, num_classes=10).to(device)
-    
-    # Initialize the global model's classifier layer with the new aggregated weights and biases
-    new_global_model.fc2.weight.data.copy_(new_agg_weight)
-    new_global_model.fc2.bias.data.copy_(new_agg_bias)
-    
 
     # new GlobalModel with updated input size
     new_global_model = GlobalModel(input_size=588, hidden_size=260, num_classes=10).to(device)
