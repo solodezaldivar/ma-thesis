@@ -1,62 +1,106 @@
 # TODO: compare time perspective of retraining the whole federation vs only the global model
 # TODO: Taking average of the hidden outputs of the local models and then feeding it to the global model to make faster
 # TODO: accuracy before and after unlearning for DVFU approach vs retrain from scratch?
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.data as data
+from torch import Tensor
 from torchvision import datasets, transforms
-import os
 import psutil
 import time
 import numpy as np
-from torch.utils.data import TensorDataset, DataLoader, Subset
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.metrics import f1_score, classification_report
-from collections import Counter
 import torch.nn.functional as F
 import warnings
-import matplotlib.pyplot as plt
+import random
 from plotting import plot_unlearning_findings, plot_report_diff, plot_resource_comparison
-
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-
-########################################### Data Loading ###########################################
-# Fashion-MNIST data
-def load_fashion_mnist_data():
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-    train_dataset = datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
-    test_dataset = datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
-    return train_dataset, test_dataset
-
-
 ########################################### Constants ###########################################
+FASHION_MNIST = "Fashion-MNIST"
+MNIST = "MNIST"
 BATCH_SIZE = 500
 PARTIES = 4
 non_IID = False
-EXTREME_NON_IID_CASE = "extreme non-IID Case"
-NON_IID_CASE = "non-IID Case"
-IID_CASE = "IID Case"
-MNIST = "MNIST"
+EXTREME_NON_IID_CASE = "extreme-non-IID-Case"
+NON_IID_CASE = "non-IID-Case"
+IID_CASE = "IID-Case"
 
-label_spec_extreme_non_iid = {
+# MNIST
+label_spec_extreme_non_iid_mnist = {
     0: (5, 0.0),
     1: (5, 1.0),
     2: (5, 0.0),
     3: (5, 0.0),
 }
 
-label_spec_normal_non_iid = {
+label_spec_normal_non_iid_mnist = {
     0: (5, 0.1),
     1: (5, 0.7),
     2: (5, 0.0),
     3: (5, 0.2),
 }
 
-label_spec_even_iid = None
+# FMNIST
+label_spec_extreme_non_iid_fashion_mnist = {
+    0: (5, 0.0),
+    1: (5, 0.0),
+    2: (5, 0.0),
+    3: (5, 1.0),
+}
+
+label_spec_normal_non_iid_fashion_mnist = {
+    0: (5, 0.1),
+    1: (5, 0.2),
+    2: (5, 0.0),
+    3: (5, 0.7),
+}
+
+# Seed for reproducibility
+def set_seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # For some operations, setting torch.backends may further improve reproducibility:
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+########################################### Data Loading ###########################################
+# Fashion-MNIST data
+def load_fashion_mnist_data():
+    transform_train = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize((0.2860,), (0.3530,)),
+        transforms.Lambda(lambda x: x.view(-1))
+    ])
+
+    # Preprocessing for the test set (usually no augmentation, only normalization)
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.2860,), (0.3530,)),
+        transforms.Lambda(lambda x: x.view(-1))
+    ])
+    train_dataset = datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform_train)
+    test_dataset = datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform_test)
+    return train_dataset, test_dataset
+
+def load_mnist_data():
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x.view(-1))  # Flatten to 784
+    ])
+
+    train_dataset = datasets.MNIST(root='./data', train=True, transform=transform, download=True)
+    test_dataset = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+    return train_dataset, test_dataset
 
 ########################################### Model Definitions ###########################################
 class SharedModel(nn.Module):
@@ -105,7 +149,7 @@ def force_batch_size(tensor, target_size):
 
 
 ################################# Unlearning Metrics #################################
-def membership_inference_attack(global_model, dataloader, unlearning_step=False):
+def loss_eval(global_model, dataloader, unlearning_step=False):
     global_model.eval()
     with torch.no_grad():
         data, labels = next(iter(dataloader))
@@ -194,42 +238,68 @@ def generate_hidden_outputs(models, data, device):
 
 def train_shared_models(models, device, train_loaders, optimizers, epoch_total, input_size):
     total_resources_shared_model_training = 0
+    final_epoch_accuracy = None  # Will hold the accuracy of the final epoch
+
+    # Set all models to training mode
     for model in models:
         model.train()
-    for i, dataloader in enumerate(train_loaders):
-        for epoch in range(0, epoch_total):
+
+    # Iterate over each DataLoader (each representing a party's data loader)
+    for loader in train_loaders:
+        for epoch in range(epoch_total):
             start_time = time.time()
+            correct = 0
+            total = 0
 
-            for batch_idx, (data, target) in enumerate(dataloader):
-                batch_start_time = time.time()
+            # Iterate over each batch in the loader
+            for batch_idx, (data, target) in enumerate(loader):
                 data, target = data.to(device), target.to(device)
-                data = data.view(data.size(0),
-                                 -1)  # We flatten the image into a single vector, preserving the zero values for non-responsible features
+                data = data.view(data.size(0), -1)  # Flatten the image
 
+                # Generate hidden outputs from each shared model
                 hidden_outputs = generate_hidden_outputs(models, data, device)
-
                 combined_hidden_outputs = torch.cat(hidden_outputs, dim=1)
 
-                # For Backpropagation loss sharing mechanism, we first append the loss from each model
+                # Initialize variables to accumulate loss and outputs
                 losses = []
+                outputs_sum = None
+
+                # For each model, compute predictions and loss
                 for i, model in enumerate(models):
                     output = model.predict(combined_hidden_outputs)
                     loss = nn.CrossEntropyLoss()(output, target)
                     losses.append(loss)
 
-                # Next we share the backpropagation loss
-                total_loss = sum(losses)  # The sum of all losses is shared
+                    # Aggregate outputs: here we sum the logits from each model
+                    if outputs_sum is None:
+                        outputs_sum = output
+                    else:
+                        outputs_sum = outputs_sum + output
+
+                total_loss = sum(losses)
                 total_loss.backward()
 
-                # Next up, need to update the model with these shared gradients
+                # Update each model's parameters with its corresponding optimizer
                 for i, model in enumerate(models):
                     optimizer = optimizers[i]
                     optimizer.step()
                     optimizer.zero_grad()
+
+                # Compute predictions from the aggregated outputs
+                preds = torch.argmax(outputs_sum, dim=1)
+                correct += (preds == target).sum().item()
+                total += target.size(0)
+
+            # Compute accuracy for the epoch
+            epoch_accuracy = (correct / total * 100.0) if total > 0 else 0.0
+            final_epoch_accuracy = epoch_accuracy
+
             epoch_time = time.time() - start_time
             total_resources_shared_model_training += track_resource_usage(epoch_time, "Shared Models Training")
-            print(f"Shared Model [{epoch + 1}/{epoch_total}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}")
-    return models, total_resources_shared_model_training
+            print(f"Shared Model [{epoch + 1}/{epoch_total}] - Time: {epoch_time:.2f}s, Loss: {loss.item():.4f}, Accuracy: {epoch_accuracy:.2f}%")
+
+    return models, total_resources_shared_model_training, final_epoch_accuracy
+
 
 
 # Function to safely initialize or get gradients - Code from DevertiFL repo
@@ -288,18 +358,24 @@ def partition_dataset(dataset, num_partitions, batch_size=500, shuffle=True, fix
     dataloaders = []
     for i in range(num_partitions):
         start = i * partition_size
-
         end = (i + 1) * partition_size if i < num_partitions - 1 else feature_dim
         partition_samples = []
         for data, label in dataset:
             if label_spec is not None and i in label_spec:
                 target_label, keep_prob = label_spec[i]
-                if label == target_label:
-                    if np.random.rand() > keep_prob:  # only include sample with probability keep_prob.
+                if keep_prob == 1.0:
+                    # Extreme case: only include sample if label equals target_label.
+                    if label != target_label:
                         continue
-            new_data = torch.zeros(fixed_size, dtype=data.dtype)  # fixed to match input size of shared model
+                else:
+                    # Non-extreme: if the label matches the target, include with probability keep_prob.
+                    if label == target_label and np.random.rand() > keep_prob:
+                        continue
+            # Create a tensor of fixed_size and copy the appropriate slice.
+            new_data = torch.zeros(fixed_size, dtype=data.dtype)
             slice_data = data[start:end]
-            new_data[:slice_data.numel()] = slice_data
+            # Truncate slice_data if it's larger than fixed_size.
+            new_data[:min(slice_data.numel(), fixed_size)] = slice_data[:fixed_size]
             partition_samples.append((new_data, label))
 
         dataloader = DataLoader(partition_samples, batch_size=batch_size, shuffle=shuffle)
@@ -335,12 +411,20 @@ def train_distilled(teacher_model, train_loader, device, temperature=2.0, num_ep
 
 
 ############################### Aggregate fc_out Weights from Shared Models ###############################
-def aggregate_fc_out_weights(state_dicts):
+def aggregate_fc_out_weights(state_dicts, model_scores=None) -> Tuple[Tensor, Tensor]:
     weights = [sd['fc_out.weight'] for sd in state_dicts]
     biases = [sd['fc_out.bias'] for sd in state_dicts]
-    aggregated_weight = torch.stack(weights).mean(dim=0)
-    aggregated_bias = torch.stack(biases).mean(dim=0)
-    return aggregated_weight, aggregated_bias
+
+    if model_scores is None:
+        normalized_weights = [1.0 / len(state_dicts) for _ in state_dicts]
+    else:
+        total_score = sum(model_scores)
+        normalized_weights = [score / total_score for score in model_scores]
+
+    aggregated_weights = sum((w * param for w, param in zip(normalized_weights, weights)), torch.zeros_like(weights[0]))
+
+    aggregated_bias = sum((w * param for w, param in zip(normalized_weights, biases)), torch.zeros_like(biases[0]))
+    return aggregated_weights, aggregated_bias
 
 
 ###################################### Fine-Tuning Global Model on Raw MNIST Data ######################################
@@ -368,8 +452,8 @@ def train_global_model(global_model: GlobalModel, train_loader, device, num_epoc
 
 
 ######################################### Evaluation #########################################
-def evaluate_model(global_model: GlobalModel, test_loader: DataLoader, device, shared_models=None,
-                   unlearning_step=False):
+def evaluate_global_model(global_model: GlobalModel, test_loader: DataLoader, device,
+                          unlearning_step=False):
     global_model.eval()
     all_preds, all_targets = [], []
     with torch.no_grad():
@@ -393,6 +477,31 @@ def evaluate_model(global_model: GlobalModel, test_loader: DataLoader, device, s
     print(report)
     return accuracy, f1, report
 
+
+def evaluate_shared_model(global_model: GlobalModel, test_loader: DataLoader, device, shared_models=None,
+                          unlearning_step=False):
+    global_model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for data, labels in test_loader:
+            data = data.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            if not unlearning_step:
+                outputs = global_model(data)
+            else:
+                data = torch.cat((data[:, :196], data[:, 392:]), dim=1)  # keep only m1, m3, and m4
+                outputs = global_model(data)
+            _, predicted = torch.max(outputs, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(labels.cpu().numpy())
+    f1 = f1_score(all_targets, all_preds, average="macro")
+    accuracy = 100 * np.mean(np.array(all_preds) == np.array(all_targets))
+    report = classification_report(all_targets, all_preds, digits=4, output_dict=True)
+    print(f"Evaluation Accuracy: {accuracy:.2f}%")
+    print(f"F1 Score: {f1:.4f}")
+    print("Classification Report:")
+    print(report)
+    return accuracy, f1, report
 
 ###################################### Fine-Tuning Global Model on Remaining Data #####################################
 def fine_tune_on_remaining_data(global_model, train_loader, device, num_epochs=5):
@@ -430,28 +539,30 @@ def fine_tune_on_remaining_data(global_model, train_loader, device, num_epochs=5
 
 
 ############################### Forget step direct ###############################
-def forget_shared_model_direct(forget_name, shared_models, device):
+def forget_shared_model_direct(forget_name, shared_models, device, model_scores, rfs):
     all_names = ["shared_ab", "shared_ac", "shared_ad"]
 
     remaining_models = []
-    for name, model in zip(all_names, shared_models):
+    remaining_models_scores = []
+    for name, model, score in zip(all_names, shared_models, model_scores):
         if name != forget_name:
             remaining_models.append(model)
+            remaining_models_scores.append(score)
 
-    print(f"Remaining models after forgetting {forget_name}: {len(remaining_models)}")
+    print(f"Remaining models after forgetting {forget_name}: {len(remaining_models)}: {remaining_models}")
     if len(remaining_models) == 0:
         print("No remaining models available. Cannot unlearn.")
         return None
 
     # aggregate fc_out weights and biases from the remaining models
     remaining_state_dicts = [sm[0].state_dict() for sm in remaining_models]
-    new_agg_weight, new_agg_bias = aggregate_fc_out_weights(remaining_state_dicts)
+    new_agg_weight, new_agg_bias = aggregate_fc_out_weights(remaining_state_dicts, remaining_models_scores)
 
     # new GlobalModel with updated input size
     new_global_model = GlobalModel(input_size=588, hidden_size=260, num_classes=10).to(device)
-
-    new_global_model.fc_out.weight.data.copy_(new_agg_weight)
-    new_global_model.fc_out.bias.data.copy_(new_agg_bias)
+    if not rfs:
+        new_global_model.fc_out.weight.data.copy_(new_agg_weight)
+        new_global_model.fc_out.bias.data.copy_(new_agg_bias)
 
     print("Global model fc_out updated using direct average of remaining shared models after unlearning", forget_name)
     return new_global_model
@@ -497,47 +608,48 @@ def compare_state_dicts(model1, model2, atol=1e-6, rtol=1e-5):
 
 
 ############################################ Main Process ############################################
-def dvfu_framework(scenario: str):
+def dvfu_framework(scenario: str, dataset_name: str, retraining_from_scratch: bool):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x.view(-1))  # Flatten to 784
-    ])
 
-    train_dataset = datasets.MNIST(root='./data', train=True, transform=transform, download=True)
-    test_dataset = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+    if dataset_name.upper() == "mnist".upper():
+        train_dataset, test_dataset = load_mnist_data()
+        label_spec_non_iid, label_spec_extreme_non_iid = label_spec_normal_non_iid_fashion_mnist, label_spec_extreme_non_iid_fashion_mnist
+    elif dataset_name.upper() == "Fashion-MNIST".upper():
+        train_dataset, test_dataset = load_fashion_mnist_data()
+        label_spec_non_iid, label_spec_extreme_non_iid = label_spec_normal_non_iid_mnist, label_spec_extreme_non_iid_mnist
+# elif dataset_name.upper() == "bank_marketing".upper():
+    #     train_dataset, test_dataset, dataset = load_bank_marketing_data()
+    else:
+        raise ValueError(f"Dataset {dataset_name} is not supported.")
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-
     # partition the dataset into 4 disjoint subsets
-    dataloaders = get_data_loader(dataset, label_spec_extreme_non_iid, scenario)
+    dataloaders = get_data_loader(train_dataset, scenario, label_spec_non_iid, label_spec_extreme_non_iid)
 
     # Initialize three shared models.
-    shared_ab, shared_ac, shared_ad, total_cpu_usage_sm = get_shared_models(dataloaders, device)
+    shared_ab, shared_ac, shared_ad, total_cpu_usage_sm, model_scores = get_shared_models(dataloaders, device)
 
     print("SharedModels training complete.")
     # compare_state_dicts(shared_ab[0], shared_ab[1])
     # compare_state_dicts(shared_ac[0], shared_ac[1])
-    # compare_state_dicts(shared_ad[0], shared_ad[1])    
+    # compare_state_dicts(shared_ad[0], shared_ad[1])
 
     state_dicts = [shared_ab[0].state_dict(), shared_ac[0].state_dict(), shared_ad[0].state_dict()]
-    agg_weight, agg_bias = aggregate_fc_out_weights(state_dicts)
+    agg_weight, agg_bias = aggregate_fc_out_weights(state_dicts, model_scores)
     print("\nAggregated fc_out weights shape:", agg_weight.shape)
 
-    global_model = create_global_model_agg_weights(agg_bias, agg_weight)
+    global_model = create_global_model_agg_weights(agg_bias, agg_weight, False)
 
-    print("Fine-tuning Global Model on raw %s training data" % MNIST)
+    print("Fine-tuning Global Model on raw %s training data" % dataset_name)
     global_model, cpu = train_global_model(global_model, train_loader, device, num_epochs=5)
 
-    print("\nEvaluating Global Model on %s test data..." % MNIST)
-    acc_before, f1_before, report_before = evaluate_model(global_model, test_loader, device,
-                                                          [shared_ab, shared_ac, shared_ad], unlearning_step=False)
+    print("\nEvaluating Global Model on %s test data..." % dataset_name)
+    acc_before, f1_before, report_before = evaluate_global_model(global_model, test_loader, device, unlearning_step=False)
 
     # print("Running Unlearning Verification before Forgetting...")
-    loss_before = membership_inference_attack(global_model, train_loader)
+    loss_before = loss_eval(global_model, train_loader)
     confi_forgotten_before, confi_unseen_before = confidence_score_difference(global_model, train_loader, test_loader)
     mia_acc_before = adversarial_mia_attack(global_model, train_loader, test_loader, device)
 
@@ -547,7 +659,7 @@ def dvfu_framework(scenario: str):
     # Unlearning
     remaining_shared_models = [shared_ab, shared_ac, shared_ad]
 
-    new_global_model = forget_shared_model_direct("shared_ab", remaining_shared_models, device)
+    new_global_model = forget_shared_model_direct("shared_ad", remaining_shared_models, device, model_scores, retraining_from_scratch) #TODO: forget shared_ad for fmnist
     if new_global_model is not None:
         new_global_model, cpu_fine_tune = fine_tune_on_remaining_data(new_global_model, train_loader,
                                                                       device=device, num_epochs=5)
@@ -555,10 +667,10 @@ def dvfu_framework(scenario: str):
         # global_model = train_distilled(new_global_model, train_loader, device, temperature=2.0, num_epochs=5)
 
         print("\nEvaluating Global Model after unlearning 'shared_ab'...")
-        acc_after, f1_after, report_after = evaluate_model(new_global_model, test_loader, device, None,
-                                                           unlearning_step=True)
+        acc_after, f1_after, report_after = evaluate_global_model(new_global_model, test_loader, device,
+                                                                  unlearning_step=True)
         print("Running Unlearning Verification after Forgetting...")
-        loss_after = membership_inference_attack(new_global_model, train_loader, unlearning_step=True)
+        loss_after = loss_eval(new_global_model, train_loader, unlearning_step=True)
         confi_forgotten_after, confi_unseen_after = confidence_score_difference(new_global_model, train_loader,
                                                                                 test_loader, unlearning_step=True)
         mia_acc_after = adversarial_mia_attack(new_global_model, train_loader, test_loader, device,
@@ -567,32 +679,35 @@ def dvfu_framework(scenario: str):
         total_cpu_usage_sm += cpu_fine_tune + cpu
         print(f"Total CPU Usage: {total_cpu_usage_sm} GB")
         if scenario == EXTREME_NON_IID_CASE:
-            plot_report_diff(report_before, report_after, MNIST, EXTREME_NON_IID_CASE)
+            plot_report_diff(report_before, report_after, dataset_name, EXTREME_NON_IID_CASE)
             plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, confi_forgotten_after,
                                      confi_unseen_before, confi_unseen_after, mia_acc_before, mia_acc_after,
-                                     MNIST,
+                                     dataset_name,
                                      EXTREME_NON_IID_CASE)
             # plot_resource_comparison(360.287, 51.64, 210.339, 29.06, MNIST, EXTREME_NON_IID_CASE)
         elif scenario == NON_IID_CASE:
-            plot_report_diff(report_before, report_after, MNIST, NON_IID_CASE)
+            plot_report_diff(report_before, report_after, dataset_name, NON_IID_CASE, retraining_from_scratch)
             plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, confi_forgotten_after,
                                      confi_unseen_before, confi_unseen_after, mia_acc_before, mia_acc_after,
-                                     MNIST,
-                                     NON_IID_CASE)
+                                     dataset_name,
+                                     NON_IID_CASE, retraining_from_scratch)
             # plot_resource_comparison(360.287, 51.64, 210.339, 29.06, MNIST, NON_IID_CASE)
 
         else:
-            plot_report_diff(report_before, report_after, MNIST, IID_CASE)
+            plot_report_diff(report_before, report_after, dataset_name, IID_CASE, retraining_from_scratch)
             plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, confi_forgotten_after,
                                      confi_unseen_before, confi_unseen_after, mia_acc_before, mia_acc_after,
-                                     MNIST,
-                                     IID_CASE)
+                                     dataset_name,
+                                     IID_CASE, retraining_from_scratch)
             # plot_resource_comparison(360.287, 51.64, 210.339, 29.06, MNIST, NON_IID_CASE)
 
 
 
-def create_global_model_agg_weights(agg_bias, agg_weight):
+def create_global_model_agg_weights(agg_bias, agg_weight, rfs):
     global_model = GlobalModel(input_size=784, hidden_size=260, num_classes=10)
+    if rfs:
+        return global_model # do not share weights
+
     global_model.fc_out.weight.data.copy_(agg_weight)
     global_model.fc_out.bias.data.copy_(agg_bias)
     print("Global model fc_out initialized with aggregated shared model fc_out weights.")
@@ -604,17 +719,18 @@ def get_shared_models(dataloaders, device, federated_rounds=5):
     shared_ac = [SharedModel(), SharedModel()]  # m1 and m3
     shared_ad = [SharedModel(), SharedModel()]  # m1 and m4
     total_resources_shared_model_training = 0
+    model_scores = []
     print("Training SharedModels Deverti-FL Style")
 
     for federated_round in range(federated_rounds):
         start_time = time.time()
-        shared_ab, total_resource_ab = train_shared_models(shared_ab, device, [dataloaders[0], dataloaders[1]],
+        shared_ab, total_resource_ab, ab_acc = train_shared_models(shared_ab, device, [dataloaders[0], dataloaders[1]],
                                                            [optim.Adam(sm.parameters(), lr=0.001) for sm in shared_ab], 5,
                                                            196)
-        shared_ac, total_resource_ac = train_shared_models(shared_ac, device, [dataloaders[0], dataloaders[2]],
+        shared_ac, total_resource_ac, ac_acc = train_shared_models(shared_ac, device, [dataloaders[0], dataloaders[2]],
                                                            [optim.Adam(sm.parameters(), lr=0.001) for sm in shared_ac], 5,
                                                            196)
-        shared_ad, total_resource_ad = train_shared_models(shared_ad, device, [dataloaders[0], dataloaders[3]],
+        shared_ad, total_resource_ad, ad_acc = train_shared_models(shared_ad, device, [dataloaders[0], dataloaders[3]],
                                                            [optim.Adam(sm.parameters(), lr=0.001) for sm in shared_ad], 5,
                                                            196)
         total_resources_shared_model_training += total_resource_ab + total_resource_ac + total_resource_ad
@@ -623,15 +739,16 @@ def get_shared_models(dataloaders, device, federated_rounds=5):
         selective_exchange_gradients(shared_ad, 260)
         federated_round_time = time.time() - start_time
         print(f"Federated Rounds [{federated_round + 1}/{federated_rounds}] - Time: {federated_round_time:.2f}s, Resource Consumption: {total_resources_shared_model_training:.4f} GB")
+        print(f"Accuracy: {ab_acc}, {ac_acc}, {ad_acc}")
+        model_scores = [ab_acc, ac_acc, ad_acc]
+    return shared_ab, shared_ac, shared_ad, total_resources_shared_model_training, model_scores
 
-    return shared_ab, shared_ac, shared_ad, total_resources_shared_model_training
 
-
-def get_data_loader(dataset, label_spec_scenario, scenario=None):
-    if scenario == EXTREME_NON_IID_CASE:
-        dataloaders = partition_dataset(dataset, 4, 500, True, 392, label_spec_scenario)
-    elif scenario == NON_IID_CASE:
-        dataloaders = partition_dataset(dataset, 4, 500, True, 392, label_spec_scenario)
+def get_data_loader(dataset, scenario=None, label_spec_non_iid=None, label_spec_extreme_non_iid=None):
+    if scenario == EXTREME_NON_IID_CASE and label_spec_extreme_non_iid:
+        dataloaders = partition_dataset(dataset, 4, 500, True, 392, label_spec_extreme_non_iid)
+    elif scenario == NON_IID_CASE and label_spec_extreme_non_iid:
+        dataloaders = partition_dataset(dataset, 4, 500, True, 392, label_spec_non_iid)
     else:
         dataloaders = partition_dataset(dataset, 4, 500, True, 392)
     return dataloaders
@@ -639,7 +756,7 @@ def get_data_loader(dataset, label_spec_scenario, scenario=None):
 
 if __name__ == "__main__":
     start_time = time.time()
-    dvfu_framework(IID_CASE)
+    dvfu_framework(IID_CASE, FASHION_MNIST, True)
     total_time = time.time() - start_time
     track_resource_usage(0, "Complete Execution")
     print(f"Total execution time: {total_time:.2f} seconds")
