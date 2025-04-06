@@ -90,9 +90,9 @@ def plot_report_diff(report_before, report_after, dataset_name, case, retrain_fr
     plt.tight_layout()
 
     if retrain_from_scratch:
-        plt.savefig(f"./resources/{dataset_name}/{case}/no_shared_models/precision_diff_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/no_shared_models/precision_diff_{case}.png")
     else:
-        plt.savefig(f"./resources/{dataset_name}/{case}/precision_diff_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/precision_diff_{case}.png")
     plt.show(block=False)
     plt.close()
 
@@ -138,9 +138,9 @@ def plot_report_diff(report_before, report_after, dataset_name, case, retrain_fr
     plt.tight_layout()
 
     if retrain_from_scratch:
-        plt.savefig(f"./resources/{dataset_name}/{case}/no_shared_models/recall_diff_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/no_shared_models/recall_diff_{case}.png")
     else:
-        plt.savefig(f"./resources/{dataset_name}/{case}/recall_diff_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/recall_diff_{case}.png")
     plt.show(block=False)
     plt.close()
 
@@ -187,9 +187,9 @@ def plot_report_diff(report_before, report_after, dataset_name, case, retrain_fr
     plt.tight_layout()
 
     if retrain_from_scratch:
-        plt.savefig(f"./resources/{dataset_name}/{case}/no_shared_models/f1_diff_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/no_shared_models/f1_diff_{case}.png")
     else:
-        plt.savefig(f"./resources/{dataset_name}/{case}/f1_diff_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/f1_diff_{case}.png")
     plt.show(block=False)
     plt.close()
 
@@ -312,9 +312,9 @@ def plot_unlearning_findings(loss_before, loss_after, confi_forgotten_before, co
     fig.tight_layout()
 
     if retrain_from_scratch:
-        plt.savefig(f"./resources/{dataset_name}/{case}/no_shared_models/unlearning_findings_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/no_shared_models/unlearning_findings_{case}.png")
     else:
-        plt.savefig(f"./resources/{dataset_name}/{case}/unlearning_findings_{case}.png")
+        plt.savefig(f"../resources/{dataset_name}/{case}/unlearning_findings_{case}.png")
     plt.show(block=False)
     plt.close()
 
@@ -342,7 +342,7 @@ def plot_resource_comparison(cpu_usage_retrain, exec_time_retrain, cpu_usage_dfv
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
 
-    plt.savefig(f"./resources/{dataset_name}/{case}/resource_consumption_{case}.png")
+    plt.savefig(f"../resources/{dataset_name}/{case}/resource_consumption_{case}.png")
     plt.show(block=False)
     plt.close()
 
@@ -377,7 +377,7 @@ def annotate_bars_v1(bar_container):
 #
 #     plt.suptitle(f'{dataset_name}: Resource Usage Comparison: Retraining From Scratch (Baseline) vs DFVU-Framework \n in {case}')
 #     plt.tight_layout(rect=[0, 0, 1, 0.95])
-#     plt.savefig(f"./resources/{dataset_name}/{case}/no_shared_models/resource_consumption_{case}.png")
+#     plt.savefig(f"../resources/{dataset_name}/{case}/no_shared_models/resource_consumption_{case}.png")
 #     pltblock=False.show()
 # plt.close()
 
@@ -426,18 +426,18 @@ def plot_difference_retrain(f1_before_dvfu, f1_before_retrain, f1_after_dvfu, f1
     annotate_bars(bars1)
     annotate_bars(bars2)
     plt.tight_layout()
-    plt.savefig(f"./resources/{dataset_name}/{case}/dvfu_retrain_f1_diff_{case}.png")
+    plt.savefig(f"../resources/{dataset_name}/{case}/dvfu_retrain_f1_diff_{case}.png")
 
     plt.show(block=False)
     plt.close()
 
 
-def resource_usage(total_cpu, total_time, dataset_name):
-    categories = ['IID', 'IID RTFS', 'Non-IID', 'Non-IID RTFS', 'Extreme', 'Extreme RTFS']
-    plt.figure()
+def resource_usage(total_cpu_wf, total_cpu_rtfs, total_time_wf, total_time_rtfs, dataset_name):
+    if dataset_name.upper() == "BANK_MARKETING":
+        categories = ['IID']
+    else:
+        categories = ['IID', 'IID RTFS', 'Non-IID', 'Non-IID RTFS', 'Extreme', 'Extreme RTFS']
 
-    dvfu_cpu, rtfs_cpu = total_cpu
-    dvfu_time, rtfs_time = total_time
 
     # X-axis positions for the categories
     x = np.arange(len(categories))
@@ -447,8 +447,8 @@ def resource_usage(total_cpu, total_time, dataset_name):
     fig, axs = plt.subplots(1, 2, figsize=(14, 6))
 
     # Plot CPU memory usage
-    axs[0].bar(x - width/2, dvfu_cpu, width, label='DVFU-WF', color="skyblue")
-    axs[0].bar(x + width/2, rtfs_cpu, width, label='RTFS', color="lightcoral")
+    axs[0].bar(x - width/2, total_cpu_wf, width, label='DVFU-WF', color="skyblue")
+    axs[0].bar(x + width/2, total_cpu_rtfs, width, label='RTFS', color="lightcoral")
     axs[0].set_xticks(x)
     axs[0].set_xticklabels(categories)
     axs[0].set_ylabel('CPU Memory (GB)')
@@ -456,8 +456,8 @@ def resource_usage(total_cpu, total_time, dataset_name):
     axs[0].legend()
 
     # Plot total training time
-    axs[1].bar(x - width/2, dvfu_time, width, label='DVFU-WF', color="skyblue")
-    axs[1].bar(x + width/2, rtfs_time, width, label='RTFS', color="lightcoral")
+    axs[1].bar(x - width/2, total_time_wf, width, label='DVFU-WF', color="skyblue")
+    axs[1].bar(x + width/2, total_time_rtfs, width, label='RTFS', color="lightcoral")
     axs[1].set_xticks(x)
     axs[1].set_xticklabels(categories)
     axs[1].set_ylabel('Time (seconds)')
@@ -465,5 +465,5 @@ def resource_usage(total_cpu, total_time, dataset_name):
     axs[1].legend()
 
     plt.tight_layout()
-    plt.savefig(f"./resources/{dataset_name}/time_diff_with_rtfs.png")
+    plt.savefig(f"../resources/{dataset_name}/time_diff_with_rtfs.png")
     plt.show()

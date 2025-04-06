@@ -9,12 +9,12 @@ import numpy as np
 import psutil
 import torch
 import torch.nn as nn
+from torchvision import datasets, transforms
 import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import f1_score, classification_report
 from torch import Tensor
 from torch.utils.data import TensorDataset, DataLoader
-from torchvision import datasets, transforms
 
 from plotting import plot_unlearning_findings, plot_report_diff, resource_usage
 
@@ -103,8 +103,8 @@ def load_mnist_data():
         transforms.Lambda(lambda x: x.view(-1))  # Flatten to 784
     ])
 
-    train_dataset = datasets.MNIST(root='./data', train=True, transform=transform, download=True)
-    test_dataset = datasets.MNIST(root='./data', train=False, transform=transform, download=True)
+    train_dataset = datasets.MNIST(root='../data', train=True, transform=transform, download=True)
+    test_dataset = datasets.MNIST(root='../data', train=False, transform=transform, download=True)
     return train_dataset, test_dataset
 
 ########################################### Model Definitions ###########################################
@@ -577,7 +577,7 @@ def fine_tune_gm(models, device, train_loaders, optimizers, epoch, federated_rou
         models = gradual_parameter_freezing(federated_round, freeze_rounds, models)
 
         print(f"Federated round {federated_round}/{federated_rounds}: "
-              f"{'Classifier Frozen' if federated_round <= freeze_rounds else 'Classifier Unfrozen'}")
+              f"{'Weights Frozen' if federated_round <= freeze_rounds else 'Weights Unfrozen'}")
 
         # accumulate losses over the round
         num_models = len(models)
@@ -781,7 +781,7 @@ def dvfu_wf_framework(scenario: str, dataset_name: str):
 
     total_time = time.time() - start_time
     cpu_mem = process.memory_info().rss / (1024.0 ** 3)
-    print(f"Overall CPU Memory Usage: {cpu_mem:.2f} MB, Total Time: {total_time:.2f} seconds")
+    print(f"Overall Framework consumption metrics: \nCPU Memory Usage: {cpu_mem:.2f} GB, Total Time: {total_time:.2f} seconds")
     cpu_mem_wf, total_time_wf = cpu_mem, total_time
 
     if scenario == EXTREME_NON_IID_CASE:
@@ -811,7 +811,7 @@ def dvfu_wf_framework(scenario: str, dataset_name: str):
     optimizers = {i: optim.Adam(model.parameters(), lr=0.001) for i, model in enumerate(global_models)}
 
     global_models = fine_tune_on_remaining_data(global_models, device, global_model_dataloaders, optimizers, 5,
-                                                5, True, 5)
+                                                5,5)
     f1_after, acc_after, report_after = evaluate_gm(global_models, device, test_loader, True)
     print(f"Accuracy: {acc_before}, F1-Score: {f1_before}")
     print(report_before)
@@ -979,17 +979,22 @@ if __name__ == "__main__":
     set_seed(0)
     start_time = time.time()
     scenarios = [IID_CASE, NON_IID_CASE, EXTREME_NON_IID_CASE]
-    datasets = [MNIST, FASHION_MNIST]
+    bench_mark_datasets = [MNIST, FASHION_MNIST]
 
-    for dataset_name in datasets:
-        total_cpu = []
-        total_time = []
+    for dataset_name in bench_mark_datasets:
+        total_cpu_wf = []
+        total_cpu_rtfs = []
+
+        total_time_wf = []
+        total_time_rtfs = []
         for scenario in scenarios:
             cpu_mem_dvfu_wf, time_dvfu_wf, cpu_mem_rtfs, time_rtfs = dvfu_wf_framework(scenario, dataset_name)
-            total_cpu.append((cpu_mem_dvfu_wf, cpu_mem_rtfs))
-            total_time.append((time_dvfu_wf, time_rtfs))
+            total_cpu_wf.append(cpu_mem_dvfu_wf)
+            total_cpu_rtfs.append(cpu_mem_rtfs)
+            total_time_wf.append(time_dvfu_wf)
+            total_time_rtfs.append(time_rtfs)
             print(f"{dataset_name} - {scenario}")
             print(f"DVFU-WF: CPU={cpu_mem_dvfu_wf} and time={time_dvfu_wf}")
             print(f"RTFS: CPU={cpu_mem_rtfs} and time={time_rtfs}")
-        resource_usage(total_cpu, total_time, dataset_name)
+        resource_usage(total_cpu_wf, total_cpu_rtfs, total_time_wf, total_time_rtfs, dataset_name)
 

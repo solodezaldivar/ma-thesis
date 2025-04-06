@@ -60,9 +60,9 @@ pip install torch torchvision numpy scikit-learn psutil matplotlib
 ```
 Then to run the framework for MNIST and Fashion-MNIST
 ```bash
-python `decentralized_vertical_federated_unlearning_wf.py`
+python decentralized_vertical_federated_unlearning_wf.py
 ```
 and to run the framework for Bank-Marketing
 ```bash
-python `dvfu-wl-bank.py`
+python dvfu_wl_bank.py
 ```

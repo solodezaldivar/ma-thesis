@@ -134,7 +134,7 @@ class SharedModel(nn.Module):
         super(SharedModel, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.relu = nn.ReLU()
-        self.fc_out = nn.Linear(hidden_size * 2, num_classes)  # why times 2 here TODO
+        self.fc_out = nn.Linear(hidden_size * 2, num_classes) #*2 beause 2 parties train a shared model
 
     def forward(self, x):
         return self.relu(self.fc1(x))
@@ -676,10 +676,11 @@ def compare_state_dicts(model1, model2, atol=1e-6, rtol=1e-5):
 
 
 ############################################ Main Process ############################################
-def dvfu_wf_framework(scenario: str, dataset_name: str, retraining_from_scratch: bool):
+def dvfu_wf_framework(scenario: str, dataset_name: str):
     print(
-        f"######################### Scenario: {scenario} for {dataset_name} with retraining from scratch: {retraining_from_scratch} ######################### ")
+        f"######################### Scenario: {scenario} for {dataset_name} ######################### ")
     start_time = time.time()
+    retraining_from_scratch = False
     process = psutil.Process()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_dataset, test_dataset = load_bank_marketing_data()
@@ -756,7 +757,9 @@ def dvfu_wf_framework(scenario: str, dataset_name: str, retraining_from_scratch:
 
     total_time = time.time() - start_time
     cpu_mem = process.memory_info().rss / (1024.0 ** 3)
-    print(f"Overall CPU Memory Usage: {cpu_mem:.2f} GB, Total Time: {total_time:.2f} seconds")
+    print(f"Overall Framework consumption metrics: \nCPU Memory Usage: {cpu_mem:.2f} GB, Total Time: {total_time:.2f} seconds")
+    cpu_mem_wf, total_time_wf = cpu_mem, total_time
+
 
     # if scenario == EXTREME_NON_IID_CASE:
     #     plot_report_diff(report_before, report_after, dataset_name, EXTREME_NON_IID_CASE, retraining_from_scratch)
@@ -777,7 +780,7 @@ def dvfu_wf_framework(scenario: str, dataset_name: str, retraining_from_scratch:
                              dataset_name,
                              IID_CASE, retraining_from_scratch)
 
-    cpu_mem_wf, total_time_wf = cpu_mem, total_time
+    ######################################### Retraining from Scracth #########################################
     print("************* Now Retrain from Scratch *************")
     global_model = GlobalModel(input_size=15, hidden_size=4, num_classes=2)
 
@@ -796,7 +799,7 @@ def dvfu_wf_framework(scenario: str, dataset_name: str, retraining_from_scratch:
     total_time = time.time() - start_time
     cpu_mem = process.memory_info().rss / (1024.0 ** 3)
     cpu_mem_rtfs, total_time_rtfs = cpu_mem, total_time
-    retrain_from_scratch = True
+    retraining_from_scratch = True
     print(f"Overall CPU Memory Usage: {cpu_mem:.2f} MB, Total Time: {total_time:.2f} seconds")
 
     # if scenario == EXTREME_NON_IID_CASE:
@@ -923,7 +926,7 @@ def fine_tune_gm(models, device, train_loaders, optimizers, epoch, federated_rou
                     param.requires_grad = True
 
         print(f"Federated round {federated_round}/{federated_rounds}: "
-              f"{'Classifier Frozen' if federated_round <= freeze_rounds else 'Classifier Unfrozen'}")
+              f"{'Weights Frozen' if federated_round <= freeze_rounds else 'Weights Unfrozen'}")
 
         # Accumulate losses over the round (for possible logging or consensus exchange).
         num_models = len(models)
@@ -1030,12 +1033,12 @@ def evaluate_gm(models, device, test_loader, unlearning_step=False):
 if __name__ == "__main__":
     set_seed(5)
     start_time = time.time()
-    total_cpu = []
-    total_time = []
     cpu_mem_dvfu_wf, time_dvfu_wf, cpu_mem_rtfs, time_rtfs = dvfu_wf_framework(IID_CASE, BANK_MARKETING)
-    total_cpu.append((cpu_mem_dvfu_wf, cpu_mem_rtfs))
-    total_time.append((time_dvfu_wf, time_rtfs))
+    total_cpu_wf = [cpu_mem_dvfu_wf]
+    total_cpu_rtfs = [cpu_mem_rtfs]
+    total_time_wf = [time_dvfu_wf]
+    total_time_rtfs = [time_rtfs]
     print(f"{BANK_MARKETING} - {IID_CASE}")
     print(f"DVFU-WF: CPU={cpu_mem_dvfu_wf} and time={time_dvfu_wf}")
     print(f"RTFS: CPU={cpu_mem_rtfs} and time={time_rtfs}")
-    resource_usage(total_cpu, total_time, BANK_MARKETING)
+    resource_usage(total_cpu_wf, total_cpu_rtfs, total_time_wf, total_time_rtfs, BANK_MARKETING)
